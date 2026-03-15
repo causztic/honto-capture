@@ -22,22 +22,7 @@ import re
 import sys
 import time
 
-import Vision
-from AppKit import NSBitmapImageRep, NSPNGFileType
-from Foundation import NSURL
 from PIL import Image
-from Quartz import (
-    CGEventCreateKeyboardEvent,
-    CGEventPost,
-    CGRectNull,
-    CGWindowListCopyWindowInfo,
-    CGWindowListCreateImage,
-    kCGHIDEventTap,
-    kCGNullWindowID,
-    kCGWindowImageBoundsIgnoreFraming,
-    kCGWindowListOptionAll,
-    kCGWindowListOptionIncludingWindow,
-)
 
 
 def extract_title_from_titlebar(image_path):
@@ -55,6 +40,9 @@ def extract_title_from_titlebar(image_path):
     titlebar.save(titlebar_path, "PNG")
 
     try:
+        import Vision
+        from Foundation import NSURL
+
         image_url = NSURL.fileURLWithPath_(titlebar_path)
         request = Vision.VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLanguages_(["ja", "en"])
@@ -278,9 +266,15 @@ def is_center_spread(image_path):
     )
 
     # A seam between two photos has much higher discontinuity at center
-    # than the average discontinuity within a single photo
-    ratio = avg_center / avg_baseline if avg_baseline > 0 else 0
-    is_continuous = ratio < 1.8 or avg_center < 15
+    # than the average discontinuity within a single photo.
+    # If center diff is small (<15), the image is continuous regardless of ratio.
+    # Otherwise, require the ratio to baseline to be low.
+    if avg_center < 15:
+        is_continuous = True
+    elif avg_baseline > 0:
+        is_continuous = avg_center / avg_baseline < 1.8
+    else:
+        is_continuous = False
 
     return is_continuous
 
@@ -319,6 +313,8 @@ def split_spread(image_path, output_dir, page_num_right, page_num_left,
 
 def find_honto_window():
     """Find the main Honto app content window."""
+    from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionAll, kCGNullWindowID
+
     windows = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)
     best = None
     for w in windows:
@@ -333,6 +329,11 @@ def find_honto_window():
 
 def capture_window(window_id, output_path):
     """Capture a screenshot of a specific window."""
+    from Quartz import (
+        CGRectNull, CGWindowListCreateImage,
+        kCGWindowImageBoundsIgnoreFraming, kCGWindowListOptionIncludingWindow,
+    )
+
     image = CGWindowListCreateImage(
         CGRectNull,
         kCGWindowListOptionIncludingWindow,
@@ -342,6 +343,8 @@ def capture_window(window_id, output_path):
     if image is None:
         print("  Failed to capture window. Check Screen Recording permissions.")
         return False
+
+    from AppKit import NSBitmapImageRep, NSPNGFileType
 
     bitmap = NSBitmapImageRep.alloc().initWithCGImage_(image)
     png_data = bitmap.representationUsingType_properties_(NSPNGFileType, None)
@@ -365,6 +368,8 @@ def bring_honto_to_front():
 
 def press_left_arrow():
     """Simulate pressing the left arrow key (next page in Japanese RTL books)."""
+    from Quartz import CGEventCreateKeyboardEvent, CGEventPost, kCGHIDEventTap
+
     key_down = CGEventCreateKeyboardEvent(None, 123, True)
     key_up = CGEventCreateKeyboardEvent(None, 123, False)
     CGEventPost(kCGHIDEventTap, key_down)
@@ -373,6 +378,8 @@ def press_left_arrow():
 
 def press_right_arrow():
     """Simulate pressing the right arrow key (prev page in Japanese RTL books)."""
+    from Quartz import CGEventCreateKeyboardEvent, CGEventPost, kCGHIDEventTap
+
     key_down = CGEventCreateKeyboardEvent(None, 124, True)
     key_up = CGEventCreateKeyboardEvent(None, 124, False)
     CGEventPost(kCGHIDEventTap, key_down)
