@@ -124,52 +124,80 @@ def find_content_bounds(img):
     pixels = img.load()
 
     # --- TOP: Skip light title bar, then any dark padding ---
+    # Title bar is ~76px at 2x Retina (~152px). Cap search to avoid mistaking
+    # light-colored photo content for toolbar.
+    max_toolbar_height = 200
     top = 0
     in_toolbar = True
     for y in range(h):
-        r, g, b = pixels[w // 2, y][:3]
         if in_toolbar:
-            if not is_light_toolbar((r, g, b)):
+            # Check multiple x positions to avoid false positives from
+            # light-colored photo content at a single sample point
+            if y >= max_toolbar_height:
                 in_toolbar = False
-                # Check if we hit dark padding or directly content
-                if is_dark((r, g, b)):
-                    continue  # skip dark padding after toolbar
+                # Fall through to dark padding check
+            else:
+                toolbar_count = 0
+                num_samples = 5
+                for si in range(num_samples):
+                    sx = int(w * (si + 1) / (num_samples + 1))
+                    sr, sg, sb = pixels[sx, y][:3]
+                    if is_light_toolbar((sr, sg, sb)):
+                        toolbar_count += 1
+                if toolbar_count < num_samples * 0.6:
+                    in_toolbar = False
                 else:
-                    top = y
-                    break
-        else:
-            if not is_dark((r, g, b)):
+                    continue
+            # After toolbar ends, check if we hit dark padding or content
+            r, g, b = pixels[w // 2, y][:3]
+            if is_dark((r, g, b)):
+                pass  # fall through to dark padding skip below
+            else:
+                top = y
+                break
+        if not in_toolbar:
+            # Check multiple x positions for dark padding
+            dark_count = 0
+            num_samples = 5
+            for si in range(num_samples):
+                sx = int(w * (si + 1) / (num_samples + 1))
+                sr, sg, sb = pixels[sx, y][:3]
+                if is_dark((sr, sg, sb)):
+                    dark_count += 1
+            if dark_count < num_samples * 0.6:
                 top = y
                 break
 
     # --- BOTTOM: Scan up from bottom, skip nav bar ---
-    # Nav bar layout (bottom to top): colored scrubber line, black bar, content.
-    # Strategy: find the transition from black nav bar to content.
-    # First, skip any non-black rows at the very bottom (scrubber/icons),
-    # then skip the black bar, then we've found the content edge.
+    # Nav bar layout (bottom to top): colored scrubber line, dark bar, content.
+    # Strategy: find the transition from dark nav bar to content.
+    # The nav bar is at most ~100px at 2x Retina. Cap the search to avoid
+    # mistaking dark photo content for nav bar.
+    max_navbar_height = 120
     bottom = h
     y = h - 1
     check_points = 30
+    min_y = max(top, h - max_navbar_height)
     # Phase 1: skip scrubber/colored rows at very bottom (thin, <10px)
-    while y > top:
-        black_count = 0
+    while y > min_y:
+        dark_count = 0
         for ci in range(check_points):
             cx = int(w * (ci + 1) / (check_points + 1))
             r, g, b = pixels[cx, y][:3]
-            if r < 30 and g < 30 and b < 30:
-                black_count += 1
-        if black_count > check_points * 0.8:
-            break  # hit the black bar
+            if r < 50 and g < 50 and b < 50:
+                dark_count += 1
+        if dark_count > check_points * 0.8:
+            break  # hit the dark bar
         y -= 1
-    # Phase 2: skip the black nav bar
-    while y > top:
-        black_count = 0
+    # Phase 2: skip the dark nav bar
+    while y > min_y:
+        dark_count = 0
         for ci in range(check_points):
             cx = int(w * (ci + 1) / (check_points + 1))
             r, g, b = pixels[cx, y][:3]
-            if r < 30 and g < 30 and b < 30:
-                black_count += 1
-        if black_count < check_points * 0.3:
+            if r < 50 and g < 50 and b < 50:
+                dark_count += 1
+        if dark_count < check_points * 0.3:
             bottom = y + 1
             break
         y -= 1
@@ -216,19 +244,103 @@ def is_single_page(content_width, spread_width):
     return content_width < spread_width * 0.7
 
 
+def is_center_spread(image_path):
+    """Detect if a cropped spread is a center spread (single continuous image).
+
+    In a two-page spread, the Honto viewer has a visible dark gap/seam between
+    the two pages at the center. A center spread has continuous image content
+    across the center with no such gap.
+
+    Checks for a consistent dark vertical strip at the center of the image.
+    """
+    img = Image.open(image_path)
+    w, h = img.size
+    mid_x = w // 2
+    pixels = img.load()
+
+    # Sample the middle 60% of height to avoid top/bottom edge artifacts
+    y_start = int(h * 0.2)
+    y_end = int(h * 0.8)
+
+    # Check if there's a consistent dark vertical strip at/near center
+    # Try each column in a narrow band around center
+    for offset in range(-3, 4):
+        x = mid_x + offset
+        if x < 0 or x >= w:
+            continue
+        dark_count = 0
+        sample_count = 0
+        for y in range(y_start, y_end, 2):
+            r, g, b = pixels[x, y][:3]
+            if is_dark((r, g, b), threshold=80):
+                dark_count += 1
+            sample_count += 1
+        # If any column in the center band is mostly dark, there's a gap
+        if sample_count > 0 and dark_count / sample_count > 0.7:
+            return False  # Has a gap → normal two-page spread
+
+    return True  # No gap found → center spread
+
+
 def split_spread(image_path, output_dir, page_num_right, page_num_left):
     """Split a two-page spread into individual pages.
 
-    Splits at the center of the image. After cropping UI chrome, the remaining
-    content is the two book pages side by side with no visible separator.
+    Splits at the center gap between the two pages. Finds the actual gap
+    position by scanning for the darkest vertical strip near the center.
     For RTL books, the right page has the lower page number.
     """
     img = Image.open(image_path)
     w, h = img.size
-    mid = w // 2
+    pixels = img.load()
 
-    right_page = img.crop((mid, 0, w, h))
-    left_page = img.crop((0, 0, mid, h))
+    # Find the actual gap center by looking for the darkest vertical strip
+    # near the middle of the image
+    mid = w // 2
+    search_range = w // 20  # Search ±5% of width around center
+    best_x = mid
+    best_dark = 0
+
+    y_start = int(h * 0.2)
+    y_end = int(h * 0.8)
+
+    for x in range(mid - search_range, mid + search_range + 1):
+        if x < 0 or x >= w:
+            continue
+        dark_count = 0
+        sample_count = 0
+        for y in range(y_start, y_end, 3):
+            r, g, b = pixels[x, y][:3]
+            if is_dark((r, g, b), threshold=80):
+                dark_count += 1
+            sample_count += 1
+        if dark_count > best_dark:
+            best_dark = dark_count
+            best_x = x
+
+    # Find the full width of the gap (dark strip)
+    gap_left = best_x
+    gap_right = best_x
+    for x in range(best_x, max(best_x - 30, 0), -1):
+        dark_count = sum(
+            1 for y in range(y_start, y_end, 5)
+            if is_dark(pixels[x, y][:3], threshold=80)
+        )
+        if dark_count / max(len(range(y_start, y_end, 5)), 1) > 0.5:
+            gap_left = x
+        else:
+            break
+    for x in range(best_x, min(best_x + 30, w)):
+        dark_count = sum(
+            1 for y in range(y_start, y_end, 5)
+            if is_dark(pixels[x, y][:3], threshold=80)
+        )
+        if dark_count / max(len(range(y_start, y_end, 5)), 1) > 0.5:
+            gap_right = x
+        else:
+            break
+
+    right_page = img.crop((gap_right, 0, w, h))
+    left_page = img.crop((0, 0, gap_left, h))
 
     right_path = os.path.join(output_dir, f"page_{page_num_right:04d}.png")
     left_path = os.path.join(output_dir, f"page_{page_num_left:04d}.png")
@@ -437,15 +549,17 @@ def main():
         # Step 2: Split into individual pages (if requested)
         if args.split:
             single = is_single_page(content_width, spread_width)
+            center = not single and is_center_spread(spread_path)
 
-            if single:
-                # Single page (cover, colophon, etc.) — just rename, don't split
+            if single or center:
+                # Single page or center spread — keep as one image, don't split
                 page_path = os.path.join(
                     args.output, f"page_{page_counter:04d}.png"
                 )
                 os.rename(spread_path, page_path)
+                label = "Center spread" if center else "Single page"
                 print(
-                    f"  [spread {spread_num}/{args.pages}] Single page → page_{page_counter:04d}.png"
+                    f"  [spread {spread_num}/{args.pages}] {label} → page_{page_counter:04d}.png"
                 )
                 page_counter += 1
             else:
