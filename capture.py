@@ -234,24 +234,15 @@ def crop_content(image_path):
     return bounds, cropped.size[0]
 
 
-def is_single_page(content_width, spread_width):
-    """Determine if the cropped content is a single page vs a two-page spread.
-
-    A single page (cover, colophon) will be roughly half the width of a spread.
-    """
-    if spread_width is None:
-        return False
-    return content_width < spread_width * 0.7
-
 
 def is_center_spread(image_path):
     """Detect if a cropped spread is a center spread (single continuous image).
 
-    In a two-page spread, the Honto viewer has a visible dark gap/seam between
-    the two pages at the center. A center spread has continuous image content
-    across the center with no such gap.
+    Two separate photos placed side by side produce a sharp vertical seam —
+    nearly every row has a large color jump at the center line. A single
+    continuous image has smooth transitions across the center.
 
-    Checks for a consistent dark vertical strip at the center of the image.
+    Compares the color discontinuity at the center vs elsewhere in the image.
     """
     img = Image.open(image_path)
     w, h = img.size
@@ -261,86 +252,60 @@ def is_center_spread(image_path):
     # Sample the middle 60% of height to avoid top/bottom edge artifacts
     y_start = int(h * 0.2)
     y_end = int(h * 0.8)
+    step = 2
 
-    # Check if there's a consistent dark vertical strip at/near center
-    # Try each column in a narrow band around center
-    for offset in range(-3, 4):
-        x = mid_x + offset
-        if x < 0 or x >= w:
-            continue
-        dark_count = 0
-        sample_count = 0
-        for y in range(y_start, y_end, 2):
-            r, g, b = pixels[x, y][:3]
-            if is_dark((r, g, b), threshold=80):
-                dark_count += 1
-            sample_count += 1
-        # If any column in the center band is mostly dark, there's a gap
-        if sample_count > 0 and dark_count / sample_count > 0.7:
-            return False  # Has a gap → normal two-page spread
+    # Measure color discontinuity at the center line
+    center_diffs = []
+    for y in range(y_start, y_end, step):
+        r1, g1, b1 = pixels[mid_x - 1, y][:3]
+        r2, g2, b2 = pixels[mid_x + 1, y][:3]
+        diff = abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)
+        center_diffs.append(diff)
 
-    return True  # No gap found → center spread
+    # Measure baseline discontinuity at quarter and three-quarter points
+    baseline_diffs = []
+    for check_x in [w // 4, 3 * w // 4]:
+        for y in range(y_start, y_end, step):
+            r1, g1, b1 = pixels[check_x - 1, y][:3]
+            r2, g2, b2 = pixels[check_x + 1, y][:3]
+            diff = abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)
+            baseline_diffs.append(diff)
+
+    avg_center = sum(center_diffs) / len(center_diffs) if center_diffs else 0
+    avg_baseline = (
+        sum(baseline_diffs) / len(baseline_diffs) if baseline_diffs else 1
+    )
+
+    # A seam between two photos has much higher discontinuity at center
+    # than the average discontinuity within a single photo
+    ratio = avg_center / avg_baseline if avg_baseline > 0 else 0
+    is_continuous = ratio < 1.8 or avg_center < 15
+
+    return is_continuous
 
 
-def split_spread(image_path, output_dir, page_num_right, page_num_left):
+def split_spread(image_path, output_dir, page_num_right, page_num_left,
+                  page_width=None):
     """Split a two-page spread into individual pages.
 
-    Splits at the center gap between the two pages. Finds the actual gap
-    position by scanning for the darkest vertical strip near the center.
+    If page_width is known (from a previous split), uses it for consistent
+    page sizing. Otherwise splits at the center.
     For RTL books, the right page has the lower page number.
+
+    Returns the width of each individual page for reuse.
     """
     img = Image.open(image_path)
     w, h = img.size
-    pixels = img.load()
-
-    # Find the actual gap center by looking for the darkest vertical strip
-    # near the middle of the image
     mid = w // 2
-    search_range = w // 20  # Search ±5% of width around center
-    best_x = mid
-    best_dark = 0
 
-    y_start = int(h * 0.2)
-    y_end = int(h * 0.8)
-
-    for x in range(mid - search_range, mid + search_range + 1):
-        if x < 0 or x >= w:
-            continue
-        dark_count = 0
-        sample_count = 0
-        for y in range(y_start, y_end, 3):
-            r, g, b = pixels[x, y][:3]
-            if is_dark((r, g, b), threshold=80):
-                dark_count += 1
-            sample_count += 1
-        if dark_count > best_dark:
-            best_dark = dark_count
-            best_x = x
-
-    # Find the full width of the gap (dark strip)
-    gap_left = best_x
-    gap_right = best_x
-    for x in range(best_x, max(best_x - 30, 0), -1):
-        dark_count = sum(
-            1 for y in range(y_start, y_end, 5)
-            if is_dark(pixels[x, y][:3], threshold=80)
-        )
-        if dark_count / max(len(range(y_start, y_end, 5)), 1) > 0.5:
-            gap_left = x
-        else:
-            break
-    for x in range(best_x, min(best_x + 30, w)):
-        dark_count = sum(
-            1 for y in range(y_start, y_end, 5)
-            if is_dark(pixels[x, y][:3], threshold=80)
-        )
-        if dark_count / max(len(range(y_start, y_end, 5)), 1) > 0.5:
-            gap_right = x
-        else:
-            break
-
-    right_page = img.crop((gap_right, 0, w, h))
-    left_page = img.crop((0, 0, gap_left, h))
+    if page_width is not None:
+        # Use learned page width for consistent splits
+        right_page = img.crop((w - page_width, 0, w, h))
+        left_page = img.crop((0, 0, page_width, h))
+    else:
+        # First split — just use the center
+        right_page = img.crop((mid, 0, w, h))
+        left_page = img.crop((0, 0, mid, h))
 
     right_path = os.path.join(output_dir, f"page_{page_num_right:04d}.png")
     left_path = os.path.join(output_dir, f"page_{page_num_left:04d}.png")
@@ -348,7 +313,7 @@ def split_spread(image_path, output_dir, page_num_right, page_num_left):
     right_page.save(right_path, "PNG")
     left_page.save(left_path, "PNG")
 
-    return right_path, left_path
+    return right_page.size[0]
 
 
 def find_honto_window():
@@ -515,7 +480,7 @@ def main():
     time.sleep(args.start_delay)
 
     page_counter = args.start  # tracks individual page numbers when splitting
-    spread_width = None  # learned from the first two-page spread
+    page_width = None  # learned from first split for consistent page sizing
 
     for i in range(args.pages):
         spread_num = i + 1
@@ -548,30 +513,28 @@ def main():
 
         # Step 2: Split into individual pages (if requested)
         if args.split:
-            single = is_single_page(content_width, spread_width)
-            center = not single and is_center_spread(spread_path)
-
-            if single or center:
-                # Single page or center spread — keep as one image, don't split
+            if is_center_spread(spread_path):
+                # Single page or center spread — keep as one image
                 page_path = os.path.join(
                     args.output, f"page_{page_counter:04d}.png"
                 )
                 os.rename(spread_path, page_path)
-                label = "Center spread" if center else "Single page"
                 print(
-                    f"  [spread {spread_num}/{args.pages}] {label} → page_{page_counter:04d}.png"
+                    f"  [spread {spread_num}/{args.pages}] Single/center → page_{page_counter:04d}.png"
                 )
                 page_counter += 1
             else:
-                # Two-page spread — learn the spread width from the first one
-                if spread_width is None and content_width is not None:
-                    spread_width = content_width
-                    print(f"  Spread width: {spread_width}px")
-
+                # Two-page spread — split using learned page width
                 right_num = page_counter
                 left_num = page_counter + 1
-                split_spread(spread_path, args.output, right_num, left_num)
+                pw = split_spread(
+                    spread_path, args.output, right_num, left_num,
+                    page_width=page_width,
+                )
                 os.remove(spread_path)
+                if page_width is None:
+                    page_width = pw
+                    print(f"  Page width: {page_width}px")
                 page_counter += 2
                 print(
                     f"  [spread {spread_num}/{args.pages}] → page_{right_num:04d}.png, page_{left_num:04d}.png"
