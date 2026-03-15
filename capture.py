@@ -222,13 +222,14 @@ def find_content_bounds(img):
     return left, top, right, bottom
 
 
-def crop_content(image_path):
+def crop_content(image_path, fixed_bounds=None):
     """Crop out all UI chrome from a Honto screenshot, keeping only book content.
 
+    If fixed_bounds is provided, uses those bounds instead of detecting.
     Returns (left, top, right, bottom) crop bounds and the cropped width.
     """
     img = Image.open(image_path)
-    bounds = find_content_bounds(img)
+    bounds = fixed_bounds if fixed_bounds is not None else find_content_bounds(img)
     cropped = img.crop(bounds)
     cropped.save(image_path, "PNG")
     return bounds, cropped.size[0]
@@ -481,6 +482,7 @@ def main():
 
     page_counter = args.start  # tracks individual page numbers when splitting
     page_width = None  # learned from first split for consistent page sizing
+    crop_bounds = None  # learned from first capture for consistent cropping
 
     for i in range(args.pages):
         spread_num = i + 1
@@ -503,10 +505,14 @@ def main():
             break
 
         # Step 1: Crop UI chrome (title bar, nav bar, dark padding)
+        # Detect bounds from the first capture, then reuse for consistency
         content_width = None
         if not args.no_crop:
-            crop_box, content_width = crop_content(spread_path)
-            if i == 0:
+            crop_box, content_width = crop_content(
+                spread_path, fixed_bounds=crop_bounds
+            )
+            if crop_bounds is None:
+                crop_bounds = crop_box
                 print(
                     f"  Auto-crop: L={crop_box[0]} T={crop_box[1]} R={crop_box[2]} B={crop_box[3]}"
                 )
